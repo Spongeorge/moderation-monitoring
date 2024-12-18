@@ -37,4 +37,4 @@ airflow scheduler
 airflow webserver
 ```
 
-at which point you should be able to access airflow at [http](http://localhost:8080/)
+at which point you should be able to access airflow at [http://localhost:8080/](http://localhost:8080/)

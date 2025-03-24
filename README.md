@@ -23,6 +23,12 @@ and set up a user
 airflow users create -r Admin -f FirstName -l LastName -e email@domain.com -u username -p password
 ```
 
+## Setting up MongoDB
+
+By default, the DAG assumes MongoDB will be running on `http://localhost:27017/`.
+
+Instructions for installing and running MongoDB can be found here: [https://www.mongodb.com/docs/manual/installation/](https://www.mongodb.com/docs/manual/installation/).
+
 # Running the DAG
 Once all of the requirements are installed, run the scheduler and the webserver:
 ```
@@ -34,3 +40,7 @@ airflow webserver
 ```
 
 at which point you should be able to access airflow at [http://localhost:8080/](http://localhost:8080/)
+
+
+# Optional: Grafana/Prometheus Monitoring Stack
+[TODO]

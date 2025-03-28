@@ -23,6 +23,8 @@ and set up a user
 airflow users create -r Admin -f FirstName -l LastName -e email@domain.com -u username -p password
 ```
 
+Once airflow has been installed, the files in the `dags` folder of this repo should be moved to your airflow installation's dags folder.
+
 ## Setting up MongoDB
 
 By default, the DAG assumes MongoDB will be running on `http://localhost:27017/`.

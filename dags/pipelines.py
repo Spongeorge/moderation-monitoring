@@ -185,7 +185,7 @@ def monitorable_mods_pipeline(n_monitors, monitor_interval_hours):
         {
             "$match": {
                 "max_scrape_time": {
-                    "$lte": (datetime.now(timezone.utc) - timedelta(hours=monitor_interval_hours)).timestamp()
+                    "$lte": (datetime.now(timezone.utc) - timedelta(hours=monitor_interval_hours))
                 }
             }
         }

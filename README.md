@@ -45,4 +45,13 @@ at which point you should be able to access airflow at [http://localhost:8080/](
 
 
 # Optional: Grafana/Prometheus Monitoring Stack
-[TODO]
+
+The recommended configuration for a Grafana monitoring dashboard involves exporting metrics to an auxiliary Prometheus time-series database at regular intervals, and using that as the data source.
+
+Prometheus can be installed here: https://prometheus.io/download/
+
+Grafana can be installed here: https://grafana.com/grafana/download
+
+The query exporter we use can be installed here: https://github.com/raffis/mongodb-query-exporter
+
+We provide our `grafana.db` file which contains the dashboard recipe in this repo, which can be used by placing it within your `/grafana/data` directory.

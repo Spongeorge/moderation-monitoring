@@ -1,5 +1,7 @@
 import praw
-from utils import praw_retry
+from utils import praw_retry, SingletonSentenceTransformer, SingletonStaticModel
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 
 @praw_retry
@@ -108,10 +110,22 @@ def subreddit_name(subreddit: praw.models.Subreddit) -> str:
 def subreddit_creation_date(subreddit: praw.models.Subreddit) -> int:
     return subreddit.created_utc
 
+@praw_retry
+def subreddit_is18plus(subreddit: praw.models.Subreddit) -> bool:
+    return subreddit.over18
+
 
 @praw_retry
 def subreddit_n_rules(subreddit: praw.models.Subreddit) -> int:
     return len(subreddit.rules()['rules'])
+
+@praw_retry
+def subreddit_subscribers(subreddit: praw.models.Subreddit) -> int:
+    return subreddit.subscribers
+
+@praw_retry
+def subreddit_active_users(subreddit: praw.models.Subreddit) -> int:
+    return subreddit.active_user_count
 
 
 @praw_retry
@@ -149,16 +163,46 @@ def user_name(user: praw.models.Redditor) -> str:
 
 
 @praw_retry
-def user_link_karma(user: praw.models.Redditor) -> int:
+def user_link_karma(user: praw.models.Redditor | praw.models.Comment | praw.models.Submission) -> int:
+    if isinstance(user, praw.models.Redditor):
+        return user.link_karma
+    elif isinstance(user, praw.models.Comment) or isinstance(user, praw.models.Submission):
+        return user.author.link_karma
     return user.link_karma
 
 
 @praw_retry
-def user_comment_karma(user: praw.models.Redditor) -> int:
+def user_comment_karma(user: praw.models.Redditor | praw.models.Comment | praw.models.Submission) -> int:
+    if isinstance(user, praw.models.Redditor):
+        return user.comment_karma
+    elif isinstance(user, praw.models.Comment) or isinstance(user, praw.models.Submission):
+        return user.author.comment_karma
     return user.comment_karma
 
 
 @praw_retry
-def user_created_unix(user: praw.models.Redditor) -> int:
-    # Account creation in UTC UNIX time
+def user_created_unix(user: praw.models.Redditor | praw.models.Comment | praw.models.Submission) -> int:
+    if isinstance(user, praw.models.Redditor):
+        return user.created_utc
+    elif isinstance(user, praw.models.Comment) or isinstance(user, praw.models.Submission):
+        return user.author.created_utc
     return user.created_utc
+
+
+@praw_retry
+def user_average_comment_embedding(user: praw.models.Redditor, limit: int = 100,
+                                   model_name: str = 'minishlab/potion-base-2M') -> list:
+    comments = user.comments.new(limit=limit)
+    sentences = []
+    for comment in comments:
+        sentences.append(post_body(comment))
+
+    if len(sentences) == 0:
+        return []
+
+    #model = SingletonSentenceTransformer(model_name).model
+    model = SingletonSentenceTransformer(model_name).model
+
+    embeddings = model.encode(sentences)
+
+    return np.mean(embeddings, axis=0).tolist()

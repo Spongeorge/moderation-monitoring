@@ -8,7 +8,7 @@ from airflow.operators.python_operator import PythonOperator
 from datetime import datetime, timedelta, timezone
 import praw
 from bson import ObjectId
-from prawcore.exceptions import NotFound, Forbidden
+from prawcore.exceptions import NotFound, Forbidden, Redirect
 from bs4 import BeautifulSoup
 import re
 import random
@@ -40,29 +40,15 @@ default_args = {
 }
 
 
-def sample_reddit_users(**kwargs):
-    num_subreddits = kwargs.get('num_subreddits')
-    num_users_per_subreddit = kwargs.get('num_users_per_subreddit')
-    skip_sample = kwargs.get('skip_sample')
-
+def sample_task(**kwargs):
     client = MongoClient("mongodb://localhost:27017/")
     db = client["ContentModerationDB"]
     users_static_collection = db["users_static"]
 
-    if skip_sample:
+    if kwargs['config']['skip_sample']:
         return
 
-    with open(DATA_ROOT / 'config.json', 'r') as f:
-        config = json.load(f)
-
-    reddit = praw.Reddit(
-        client_id=kwargs['REDDIT_CLIENT_ID'],
-        client_secret=kwargs['REDDIT_SECRET'],
-        password=kwargs['REDDIT_PW'],
-        user_agent="testscript",
-        username=kwargs['REDDIT_USER'],
-        check_for_async=False
-    )
+    reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
 
     list_of_subreddits = reddit.subreddit("ListOfSubreddits")
 
@@ -87,80 +73,61 @@ def sample_reddit_users(**kwargs):
 
     unique_posters = set()
 
-    while n_subreddits_sampled < num_subreddits:
+    users_to_ignore = {"AutoModerator"}
+
+    while n_subreddits_sampled < kwargs['config']['num_subreddits']:
         new_sampled_subreddit = random.sample(list(valid_subreddits), 1)[0]
         valid_subreddits.remove(new_sampled_subreddit)
         try:
             unique_posters_ = set()
             unique_posters_count_ = 0
             posts_to_check = [x for x in reddit.subreddit(new_sampled_subreddit).new(limit=None)]
-            while posts_to_check and unique_posters_count_ < num_users_per_subreddit:
+            while posts_to_check and unique_posters_count_ < kwargs['config']['num_users_per_subreddit']:
                 submission = posts_to_check.pop()
                 if (submission.author) and (submission.author.name not in unique_posters):
                     unique_posters_.add(submission.author.name)
                     unique_posters_count_ += 1
 
-            for unique_poster in unique_posters_ - unique_posters:
+            for unique_poster in (unique_posters_ - unique_posters) - users_to_ignore:
                 redditor = reddit.redditor(unique_poster)
 
                 if hasattr(redditor, 'created_utc'):  # if account doesn't have this it is shadowbanned
                     user_update = {metric_name: getattr(metrics, metric_name)(reddit.redditor(unique_poster)) for
                                    metric_name in
-                                   config['user_metrics_static']}  # get all configured metric values
+                                   kwargs['config']['user_metrics_static']}  # get all configured metric values
                     users_static_collection.insert_one(user_update)
 
             unique_posters.update(unique_posters_)
             n_subreddits_sampled += 1
             print(n_subreddits_sampled)
 
-        except:  # Subreddit is banned or private, re-sample
+        except (NotFound, Forbidden, Redirect):  # Subreddit is banned or private, re-sample
             print("Bad subreddit... retrying.")
 
-    users_to_ignore = {"AutoModerator"}
-    unique_posters = unique_posters - users_to_ignore
 
-    reddit = praw.Reddit(
-        client_id=kwargs['REDDIT_CLIENT_ID'],
-        client_secret=kwargs['REDDIT_SECRET'],
-        password=kwargs['REDDIT_PW'],
-        user_agent="testscript",
-        username=kwargs['REDDIT_USER'],
-        check_for_async=False
-    )
-
-
-def stream_reddit_posts(**kwargs):
+def stream_task(**kwargs):
     client = MongoClient("mongodb://localhost:27017/")
-
     db = client["ContentModerationDB"]
-
-    unique_posters = db["users_static"].distinct("user_name")
-
-    ti = kwargs['ti']
 
     kwargs['ti'].xcom_push(key='streaming_has_finished', value=False)
 
     start_time = datetime.now(timezone.utc)
-    duration = timedelta(days=kwargs['stream_duration_days'])
+    duration = timedelta(days=kwargs['config']['stream_duration_days'])
 
-    if not unique_posters:
-        raise ValueError("No users were sampled from the previous task.")
+    reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
 
-    reddit = praw.Reddit(
-        client_id=kwargs['REDDIT_CLIENT_ID'],
-        client_secret=kwargs['REDDIT_SECRET'],
-        password=kwargs['REDDIT_PW'],
-        user_agent="testscript",
-        username=kwargs['REDDIT_USER'],
-        check_for_async=False
-    )
+    if kwargs['config']['stream_type'] == "subreddit":
+        streams = {
+            sr: {"comments": reddit.subreddit(sr).stream.comments(pause_after=-1, skip_existing=True),
+                 "submissions": reddit.subreddit(sr).stream.submissions(pause_after=-1, skip_existing=True)} for
+            sr in db["subreddits_static"].distinct("subreddit_name")}
+    else:
+        streams = {
+            poster: {"comments": reddit.redditor(poster).stream.comments(pause_after=-1, skip_existing=True),
+                     "submissions": reddit.redditor(poster).stream.submissions(pause_after=-1, skip_existing=True)} for
+            poster in db["users_static"].distinct("user_name")}
 
-    redditor_streams = {
-        poster: {"comments": reddit.redditor(poster).stream.comments(pause_after=-1, skip_existing=True),
-                 "submissions": reddit.redditor(poster).stream.submissions(pause_after=-1, skip_existing=True)} for
-        poster in unique_posters}
-
-    print(f"Initialized {len(redditor_streams)} redditor streams.")
+    print(f"Initialized {len(streams)} streams.")
 
     def get_comments(stream):
         comment_list = []
@@ -186,30 +153,48 @@ def stream_reddit_posts(**kwargs):
         except:  # User is suspended
             return submission_list
 
+    posts_today = {}
+    today = datetime.now(timezone.utc).date()
+
     while datetime.now(timezone.utc) - start_time < duration:
         post_count = 0
 
-        for poster in tqdm(unique_posters):
+        for k in tqdm(streams.keys()):
+            if posts_today[k]["date"] != today:
+                posts_today[k] = {"date": today, "count": 0}
+            if posts_today[k]["count"] >= kwargs['config']['MAX_POSTS_PER_STREAM_PER_DAY']:
+                continue
             try:
-                stream = redditor_streams[poster]
+                stream = streams[k]
 
                 comments = [comment for comment in get_comments(stream) if
                             comment is not None]
                 submissions = [submission for submission in get_submissions(stream) if
                                submission is not None]
 
-                post_count += len(comments) + len(submissions)
+                total_posts = len(comments) + len(submissions)
+
+                allowed_posts = kwargs['config']['MAX_POSTS_PER_STREAM_PER_DAY'] - posts_today[k]["count"]
+
+                if total_posts > allowed_posts:
+                    comments = comments[:allowed_posts]
+                    submissions = submissions[:max(0, allowed_posts - len(comments))]
+                    total_posts = len(comments) + len(submissions)
+
+                posts_today[k]["count"] += total_posts
+                post_count += total_posts
                 for post in itertools.chain(comments, submissions):
 
                     created_utc = metrics.post_created_utc(post)
 
                     if datetime.now(timezone.utc) - datetime.utcfromtimestamp(created_utc).replace(
                             tzinfo=timezone.utc) <= timedelta(
-                        hours=kwargs['monitor_interval_hours']):  # post have been made within the monitoring interval
+                        hours=kwargs['config'][
+                            'monitor_interval_hours']):  # post have been made within the monitoring interval
 
                         post_static_entry = {metric_name: getattr(metrics, metric_name)(post) for
                                              metric_name in
-                                             config['post_metrics_static']}
+                                             kwargs['config']['post_metrics_static']}
 
                         static_result = db["posts_static"].insert_one(
                             post_static_entry
@@ -223,10 +208,16 @@ def stream_reddit_posts(**kwargs):
                                 if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
                                 else getattr(metrics, metric_name)(post)
                             )
-                            for metric_name in config['post_metrics_dynamic']
+                            for metric_name in kwargs['config']['post_metrics_dynamic']
                         }
 
-                        post_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
+                        scrape_time = metrics.post_created_utc(post)
+                        if isinstance(scrape_time, int):
+                            scrape_time = datetime.fromtimestamp(scrape_time, timezone.utc)
+                        if isinstance(scrape_time, str):  # scrape_time returned an error
+                            scrape_time = datetime.now(timezone.utc)
+
+                        post_dynamic_entry["scrape_time"] = scrape_time
                         post_dynamic_entry["post_ref"] = post_static_id
 
                         db["posts_dynamic"].insert_one(
@@ -237,7 +228,7 @@ def stream_reddit_posts(**kwargs):
                         if db['subreddits_static'].find_one({"subreddit_name": post.subreddit.display_name}) is None:
                             subreddit_static_entry = {metric_name: getattr(metrics, metric_name)(post.subreddit) for
                                                       metric_name in
-                                                      config['subreddit_metrics_static']}
+                                                      kwargs['config']['subreddit_metrics_static']}
 
                             static_result = db["subreddits_static"].insert_one(
                                 subreddit_static_entry
@@ -245,7 +236,7 @@ def stream_reddit_posts(**kwargs):
 
                             subreddit_dynamic_entry = {metric_name: getattr(metrics, metric_name)(post.subreddit) for
                                                        metric_name in
-                                                       config['subreddit_metrics_dynamic']}
+                                                       kwargs['config']['subreddit_metrics_dynamic']}
 
                             subreddit_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
                             subreddit_dynamic_entry["subreddit_ref"] = static_result.inserted_id
@@ -266,7 +257,7 @@ def stream_reddit_posts(**kwargs):
 
                                             mod_static_entry = {metric_name: getattr(metrics, metric_name)(mod) for
                                                                 metric_name in
-                                                                config['mod_metrics_static']}
+                                                                kwargs['config']['moderator_metrics_static']}
 
                                             static_result = db["moderators_static"].insert_one(
                                                 mod_static_entry
@@ -281,7 +272,7 @@ def stream_reddit_posts(**kwargs):
                                                         getattr(metrics, metric_name)).parameters
                                                     else getattr(metrics, metric_name)(mod)
                                                 )
-                                                for metric_name in config['mod_metrics_dynamic']
+                                                for metric_name in kwargs['config']['moderator_metrics_dynamic']
                                             }
 
                                             mod_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
@@ -291,8 +282,10 @@ def stream_reddit_posts(**kwargs):
                                                 mod_dynamic_entry
                                             )
 
-            except (NotFound, Forbidden):  # User's account was suspended
-                unique_posters.remove(poster)
+            except (NotFound, Forbidden, Redirect):  # Stream source no longer good.
+                streams.remove(k)
+
+    kwargs['ti'].xcom_push(key='streaming_has_finished', value=True)
 
 
 @praw_retry
@@ -305,10 +298,8 @@ def get_submission(reddit, id):
     return reddit.submission(id=id)
 
 
-def monitor(**kwargs):
-    ti = kwargs['ti']
-
-    streaming_finished = ti.xcom_pull(task_ids='stream', key='streaming_has_finished')
+def monitor_task(**kwargs):
+    streaming_finished = kwargs['ti'].xcom_pull(task_ids='stream', key='streaming_has_finished')
     monitoring_finished = False
 
     client = MongoClient("mongodb://localhost:27017/")
@@ -316,18 +307,12 @@ def monitor(**kwargs):
     db = client["ContentModerationDB"]
 
     while (not streaming_finished) or (not monitoring_finished):
-        reddit = praw.Reddit(
-            client_id=kwargs['REDDIT_CLIENT_ID'],
-            client_secret=kwargs['REDDIT_SECRET'],
-            password=kwargs['REDDIT_PW'],
-            user_agent="testscript",
-            username=kwargs['REDDIT_USER'],
-            check_for_async=False
-        )
+        reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
 
         # Post Monitoring
         monitorable_posts = list(db['posts_dynamic'].aggregate(
-            pipelines.monitorable_post_pipeline(kwargs['n_monitors'], kwargs['monitor_interval_hours'])))
+            pipelines.monitorable_post_pipeline(kwargs['config']['n_monitors'],
+                                                kwargs['config']['monitor_interval_hours'])))
 
         for monitorable_post in monitorable_posts:
             if monitorable_post['post_type'] == 'comment':
@@ -341,7 +326,7 @@ def monitor(**kwargs):
                     if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
                     else getattr(metrics, metric_name)(post)
                 )
-                for metric_name in config['post_metrics_dynamic']
+                for metric_name in kwargs['config']['post_metrics_dynamic']
             }
             post_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
             post_dynamic_entry["post_ref"] = monitorable_post['post_ref']
@@ -350,80 +335,57 @@ def monitor(**kwargs):
                 post_dynamic_entry
             )
 
-            # Subreddit Monitoring
-            monitorable_subreddits = list(db['posts_static'].aggregate(
-                pipelines.monitorable_subreddit_pipeline(kwargs['n_monitors'], kwargs['monitor_interval_hours'])))
+        # Subreddit Monitoring
+        monitorable_subreddits = list(db['posts_static'].aggregate(
+            pipelines.monitorable_subreddit_pipeline(kwargs['config']['n_monitors'],
+                                                     kwargs['config']['monitor_interval_hours'])))
 
-            if len(monitorable_subreddits) > 0:
-                print(f"Found {len(monitorable_subreddits)} monitorable subreddits.")
+        if len(monitorable_subreddits) > 0:
+            print(f"Found {len(monitorable_subreddits)} monitorable subreddits.")
 
-            for monitorable_subreddit in monitorable_subreddits:
-                sr = utils.get_subreddit(reddit, monitorable_subreddit['subreddit_name'])
+        for monitorable_subreddit in monitorable_subreddits:
+            sr = utils.get_subreddit(reddit, monitorable_subreddit['subreddit_name'])
 
-                subreddit_dynamic_entry = {
-                    metric_name: (
-                        getattr(metrics, metric_name)(sr, return_default=True)
-                        if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
-                        else getattr(metrics, metric_name)(sr)
-                    )
-                    for metric_name in config['subreddit_metrics_dynamic']
-                }
-                subreddit_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
-                subreddit_dynamic_entry["subreddit_ref"] = monitorable_subreddit['subreddit_ref']
-
-                db["subreddits_dynamic"].insert_one(
-                    subreddit_dynamic_entry
+            subreddit_dynamic_entry = {
+                metric_name: (
+                    getattr(metrics, metric_name)(sr, return_default=True)
+                    if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
+                    else getattr(metrics, metric_name)(sr)
                 )
+                for metric_name in kwargs['config']['subreddit_metrics_dynamic']
+            }
+            subreddit_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
+            subreddit_dynamic_entry["subreddit_ref"] = monitorable_subreddit['subreddit_ref']
 
-                # Moderator Monitoring
-                monitorable_mods = list(db['posts_static'].aggregate(
-                    pipelines.monitorable_mods_pipeline(kwargs['n_monitors'], kwargs['monitor_interval_hours'])))
+            db["subreddits_dynamic"].insert_one(
+                subreddit_dynamic_entry
+            )
 
-                if len(monitorable_mods) > 0:
-                    print(f"Found {len(monitorable_mods)} monitorable moderators.")
+        # Moderator Monitoring
+        monitorable_mods = list(db['posts_static'].aggregate(
+            pipelines.monitorable_mods_pipeline(kwargs['config']['n_monitors'],
+                                                kwargs['config']['monitor_interval_hours'])))
 
-                for monitorable_mod in monitorable_mods:
-                    mod = utils.get_redditor(reddit, monitorable_mod['_id'])
+        if len(monitorable_mods) > 0:
+            print(f"Found {len(monitorable_mods)} monitorable moderators.")
 
-                    moderator_dynamic_entry = {
-                        metric_name: (
-                            getattr(metrics, metric_name)(mod)
-                            if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
-                            else getattr(metrics, metric_name)(mod)
-                        )
-                        for metric_name in config['moderator_metrics_dynamic']
-                    }
-                    moderator_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
-                    moderator_dynamic_entry["mod_ref"] = monitorable_mod['moderator_id']
+        for monitorable_mod in monitorable_mods:
+            mod = utils.get_redditor(reddit, monitorable_mod['_id'])
 
-                    db["moderators_dynamic"].insert_one(
-                        moderator_dynamic_entry
-                    )
-        # TODO:
-        # # Mod Monitoring
-        # monitorable_mods = list(db['moderators_dynamic'].aggregate(
-        #     monitorable_post_pipeline(kwargs['n_monitors'], kwargs['monitor_interval_hours'])))
-        #
-        # for monitorable_post in monitorable_posts:
-        #     if monitorable_post['post_type'] == 'comment':
-        #         post = get_comment(reddit, monitorable_post['post_id'])
-        #     elif monitorable_post['post_type'] == 'submission':
-        #         post = get_submission(reddit, monitorable_post['post_id'])
-        #
-        #     post_dynamic_entry = {
-        #         metric_name: (
-        #             getattr(metrics, metric_name)(post, return_default=True)
-        #             if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
-        #             else getattr(metrics, metric_name)(post)
-        #         )
-        #         for metric_name in config['post_metrics_dynamic']
-        #     }
-        #     post_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
-        #     post_dynamic_entry["post_ref"] = monitorable_post['post_ref']
-        #
-        #     db["posts_dynamic"].insert_one(
-        #         post_dynamic_entry
-        #     )
+            moderator_dynamic_entry = {
+                metric_name: (
+                    getattr(metrics, metric_name, return_default=True)(mod)
+                    if "return_default" in inspect.signature(getattr(metrics, metric_name)).parameters
+                    else getattr(metrics, metric_name)(mod)
+                )
+                for metric_name in kwargs['config']['moderator_metrics_dynamic']
+            }
+            moderator_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
+            moderator_dynamic_entry["mod_ref"] = monitorable_mod['moderator_id']
+
+            db["moderators_dynamic"].insert_one(
+                moderator_dynamic_entry
+            )
 
         if len(monitorable_posts) == 0:
             monitoring_finished = True
@@ -431,14 +393,10 @@ def monitor(**kwargs):
             monitoring_finished = False
 
 
-def monitor_moderation_teams():
-    pass
-
-
 with DAG(
         'content_moderation_data_collection',
         default_args=default_args,
-        description='Sample usernames, stream posts, and monitor post variables',
+        description='Sample usernames, stream posts, and monitor variables.',
         schedule_interval=None,
         catchup=False,
 ) as dag:
@@ -447,48 +405,31 @@ with DAG(
 
     print(DATA_ROOT / 'config.json')
     print(config)
-    sample_task = PythonOperator(
+    sample_task_operator = PythonOperator(
         task_id='sample',
-        python_callable=sample_reddit_users,
+        python_callable=sample_task,
         provide_context=True,
         op_kwargs={
-            'num_subreddits': config['n_subreddits'],
-            'num_users_per_subreddit': config['users_per_subreddit'],
-            'REDDIT_USER': config['REDDIT_USER_1'],
-            'REDDIT_CLIENT_ID': config['REDDIT_CLIENT_ID_1'],
-            'REDDIT_SECRET': config['REDDIT_SECRET_1'],
-            'REDDIT_PW': config['REDDIT_PW_1'],
-            'skip_sample': config['skip_sample']
+            'config': config
         },
     )
 
-    stream_task = PythonOperator(
+    stream_task_operator = PythonOperator(
         task_id='stream',
-        python_callable=stream_reddit_posts,
+        python_callable=stream_task,
         provide_context=True,
         op_kwargs={
-            'REDDIT_USER': config['REDDIT_USER_1'],
-            'REDDIT_CLIENT_ID': config['REDDIT_CLIENT_ID_1'],
-            'REDDIT_SECRET': config['REDDIT_SECRET_1'],
-            'REDDIT_PW': config['REDDIT_PW_1'],
-            'start_time': '{{ ts }}',
-            'stream_duration_days': config['stream_duration_days'],
-            'monitor_interval_hours': config['monitor_interval_hours']
+            'config': config
         },
     )
 
-    monitor_task = PythonOperator(
+    monitor_task_operator = PythonOperator(
         task_id='monitor',
-        python_callable=monitor,
+        python_callable=monitor_task,
         provide_context=True,
         op_kwargs={
-            'monitor_interval_hours': config['monitor_interval_hours'],
-            'n_monitors': config['n_monitors'],
-            'REDDIT_USER': config['REDDIT_USER_2'],
-            'REDDIT_CLIENT_ID': config['REDDIT_CLIENT_ID_2'],
-            'REDDIT_SECRET': config['REDDIT_SECRET_2'],
-            'REDDIT_PW': config['REDDIT_PW_2']
+            'config': config
         },
     )
 
-    sample_task >> [stream_task, monitor_task]
+    sample_task_operator >> [stream_task_operator, monitor_task_operator]

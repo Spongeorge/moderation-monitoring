@@ -116,7 +116,7 @@ def populate_from_list(kwargs):
                 subreddit_dynamic_entry
             )
 
-            if "subreddit_mods_info" in subreddit_dynamic_entry:
+            if "subreddit_mods_info" in subreddit_dynamic_entry not isinstance(subreddit_dynamic_entry["subreddit_mods_info"], str):
                 for mod in subreddit_dynamic_entry['subreddit_mods_info']:
                     if db['moderators_static'].find_one(
                             {"user_name": mod['user_name']}) is None:  # not already in DB
@@ -152,3 +152,4 @@ def populate_from_list(kwargs):
                             db["moderators_dynamic"].insert_one(
                                 mod_dynamic_entry
                             )
+

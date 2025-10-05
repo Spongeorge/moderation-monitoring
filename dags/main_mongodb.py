@@ -1,32 +1,25 @@
-import ast
-
 import inspect
 import itertools
+import logging
 
 from airflow import DAG
 from airflow.operators.python_operator import PythonOperator
 from datetime import datetime, timedelta, timezone
 import praw
-from bson import ObjectId
 from prawcore.exceptions import NotFound, Forbidden, Redirect
-from bs4 import BeautifulSoup
-import re
-import random
 from tqdm import tqdm
-from collections import defaultdict
 import json
 
 from pymongo import MongoClient
 
 import metrics
 
-import time
-
 from pathlib import Path
 
 import utils
 from utils import praw_retry
 import pipelines
+import sampling_methods
 
 DATA_ROOT = Path(__file__).resolve().parent.parent
 
@@ -41,71 +34,32 @@ default_args = {
 
 
 def sample_task(**kwargs):
-    client = MongoClient("mongodb://localhost:27017/")
-    db = client["ContentModerationDB"]
-    users_static_collection = db["users_static"]
+    """
+    The sample task performs the initial database population based on 'sample_strategy'.
 
-    if kwargs['config']['skip_sample']:
-        return
-
-    reddit = utils.Reddit(client_info=kwargs['config']['client_info'])
-
-    list_of_subreddits = reddit.subreddit("ListOfSubreddits")
-
-    def extract_subreddits(html):
-        try:
-            soup = BeautifulSoup(html, 'html.parser')
-            subreddit_links = soup.find_all('a', href=re.compile(r'^/r/'))
-            subreddits = sorted({link['href'] for link in subreddit_links if link['href'].startswith('/r/')})
-            return subreddits
-        except:
-            return []
-
-    # Extract all subreddits
-    all_subreddits = set()
-    for wiki_page in tqdm(list_of_subreddits.wiki):
-        all_subreddits.update(
-            [subreddit_name[3:].split('/')[0] for subreddit_name in extract_subreddits(wiki_page.content_html)])
-
-    valid_subreddits = all_subreddits.copy()
-
-    n_subreddits_sampled = 0
-
-    unique_posters = set()
-
-    users_to_ignore = {"AutoModerator"}
-
-    while n_subreddits_sampled < kwargs['config']['num_subreddits']:
-        new_sampled_subreddit = random.sample(list(valid_subreddits), 1)[0]
-        valid_subreddits.remove(new_sampled_subreddit)
-        try:
-            unique_posters_ = set()
-            unique_posters_count_ = 0
-            posts_to_check = [x for x in reddit.subreddit(new_sampled_subreddit).new(limit=None)]
-            while posts_to_check and unique_posters_count_ < kwargs['config']['num_users_per_subreddit']:
-                submission = posts_to_check.pop()
-                if (submission.author) and (submission.author.name not in unique_posters):
-                    unique_posters_.add(submission.author.name)
-                    unique_posters_count_ += 1
-
-            for unique_poster in (unique_posters_ - unique_posters) - users_to_ignore:
-                redditor = reddit.redditor(unique_poster)
-
-                if hasattr(redditor, 'created_utc'):  # if account doesn't have this it is shadowbanned
-                    user_update = {metric_name: getattr(metrics, metric_name)(reddit.redditor(unique_poster)) for
-                                   metric_name in
-                                   kwargs['config']['user_metrics_static']}  # get all configured metric values
-                    users_static_collection.insert_one(user_update)
-
-            unique_posters.update(unique_posters_)
-            n_subreddits_sampled += 1
-            print(n_subreddits_sampled)
-
-        except (NotFound, Forbidden, Redirect):  # Subreddit is banned or private, re-sample
-            print("Bad subreddit... retrying.")
+    sample_strategy values:
+        'skip' - Skips sampling; for resuming runs  when the database is already populated.
+        'random_subreddits' - Gets random Subreddits from ListOfSubreddits.
+        'list' - Populates the database from a static list of Subreddit or User names.
+    """
+    if 'sample_strategy' not in kwargs['config'].keys():
+        logging.warning(
+            "No sample_strategy configured, skipping sample task. To silence this, set sample_strategy to \'skip\'.")
+        sampling_methods.skip()
+    elif kwargs['config']['sample_strategy'] == 'skip':
+        sampling_methods.skip()
+    elif kwargs['config']['sample_strategy'] == 'random_subreddits':
+        sampling_methods.sample_random_subreddits(kwargs)
+    elif kwargs['config']['sample_strategy'] == 'list':
+        sampling_methods.populate_from_list(kwargs)
+    else:
+        raise NotImplementedError(f"Unknown sample_strategy: {kwargs['config']['sample_strategy']}")
 
 
 def stream_task(**kwargs):
+    """
+    The stream task ingests new posts from either praw RedditorStream or SubredditStream objects (dep. on stream_type).
+    """
     client = MongoClient("mongodb://localhost:27017/")
     db = client["ContentModerationDB"]
 
@@ -160,9 +114,9 @@ def stream_task(**kwargs):
         post_count = 0
 
         for k in tqdm(streams.keys()):
-            if posts_today[k]["date"] != today:
+            if (k not in posts_today.keys()) or (posts_today[k]["date"] != today):
                 posts_today[k] = {"date": today, "count": 0}
-            if posts_today[k]["count"] >= kwargs['config']['MAX_POSTS_PER_STREAM_PER_DAY']:
+            if posts_today[k]["count"] >= kwargs['config']['max_posts_per_stream_per_day']:
                 continue
             try:
                 stream = streams[k]
@@ -174,7 +128,7 @@ def stream_task(**kwargs):
 
                 total_posts = len(comments) + len(submissions)
 
-                allowed_posts = kwargs['config']['MAX_POSTS_PER_STREAM_PER_DAY'] - posts_today[k]["count"]
+                allowed_posts = kwargs['config']['max_posts_per_stream_per_day'] - posts_today[k]["count"]
 
                 if total_posts > allowed_posts:
                     comments = comments[:allowed_posts]
@@ -214,7 +168,7 @@ def stream_task(**kwargs):
                         scrape_time = metrics.post_created_utc(post)
                         if isinstance(scrape_time, int):
                             scrape_time = datetime.fromtimestamp(scrape_time, timezone.utc)
-                        if isinstance(scrape_time, str):  # scrape_time returned an error
+                        else:  # scrape_time returned an error
                             scrape_time = datetime.now(timezone.utc)
 
                         post_dynamic_entry["scrape_time"] = scrape_time
@@ -314,7 +268,7 @@ def monitor_task(**kwargs):
             pipelines.monitorable_post_pipeline(kwargs['config']['n_monitors'],
                                                 kwargs['config']['monitor_interval_hours'])))
 
-        for monitorable_post in monitorable_posts:
+        for monitorable_post in tqdm(monitorable_posts, desc=f"Monitoring {len(monitorable_posts)} posts."):
             if monitorable_post['post_type'] == 'comment':
                 post = get_comment(reddit, monitorable_post['post_id'])
             elif monitorable_post['post_type'] == 'submission':
@@ -343,7 +297,8 @@ def monitor_task(**kwargs):
         if len(monitorable_subreddits) > 0:
             print(f"Found {len(monitorable_subreddits)} monitorable subreddits.")
 
-        for monitorable_subreddit in monitorable_subreddits:
+        for monitorable_subreddit in tqdm(monitorable_subreddits,
+                                          desc=f"Monitoring {len(monitorable_subreddits)} subreddits."):
             sr = utils.get_subreddit(reddit, monitorable_subreddit['subreddit_name'])
 
             subreddit_dynamic_entry = {
@@ -369,7 +324,7 @@ def monitor_task(**kwargs):
         if len(monitorable_mods) > 0:
             print(f"Found {len(monitorable_mods)} monitorable moderators.")
 
-        for monitorable_mod in monitorable_mods:
+        for monitorable_mod in tqdm(monitorable_mods, desc=f"Monitoring {len(monitorable_mods)} moderators."):
             mod = utils.get_redditor(reddit, monitorable_mod['_id'])
 
             moderator_dynamic_entry = {

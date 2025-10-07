@@ -39,6 +39,41 @@ def monitorable_post_pipeline(n_monitors, monitor_interval_hours):
     ]
 
 
+def monitorable_mod_pipeline_simple(n_monitors, monitor_interval_hours):
+    return [
+        {
+            "$group": {
+                "_id": "$mod_ref",
+                "count": {"$sum": 1},
+                "max_scrape_time": {"$max": "$scrape_time"}
+            }
+        },
+        {
+            "$match": {
+                "max_scrape_time": {"$lt": datetime.now(timezone.utc) - timedelta(
+                    hours=monitor_interval_hours)}
+            }
+        },
+        {
+            "$lookup": {
+                "from": "moderators_static",
+                "localField": "_id",
+                "foreignField": "_id",
+                "as": "static_data"
+            }
+        },
+        {
+            "$unwind": "$static_data"
+        },
+        {
+            "$project": {
+                "_id": "$static_data.user_name",
+                "mod_ref": "$static_data._id"
+            }
+        }
+    ]
+
+
 def monitorable_subreddit_pipeline(n_monitors, monitor_interval_hours):
     return [
         # Select posts from the monitoring window
@@ -190,3 +225,4 @@ def monitorable_mods_pipeline(n_monitors, monitor_interval_hours):
             }
         }
     ]
+

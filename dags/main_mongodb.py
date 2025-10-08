@@ -336,7 +336,7 @@ def monitor_task(**kwargs):
                 for metric_name in kwargs['config']['moderator_metrics_dynamic']
             }
             moderator_dynamic_entry["scrape_time"] = datetime.now(timezone.utc)
-            moderator_dynamic_entry["mod_ref"] = monitorable_mod['moderator_id']
+            moderator_dynamic_entry["mod_ref"] = monitorable_mod['mod_ref']
 
             db["moderators_dynamic"].insert_one(
                 moderator_dynamic_entry
@@ -388,3 +388,4 @@ with DAG(
     )
 
     sample_task_operator >> [stream_task_operator, monitor_task_operator]
+
